@@ -236,7 +236,7 @@ TEST_P(JwtVerificationFilterIntegrationTestWithJwks, Fail1) {
   std::string pubkey = "weirdKey";
   TestVerification(createHeaders(token), "", createIssuerHeaders(), pubkey,
                    false, Http::TestHeaderMapImpl{{":status", "401"}},
-                   "Verification Failed");
+                   "JWT_BAD_FORMAT");
 }
 
 /*

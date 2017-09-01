@@ -91,6 +91,7 @@ struct JwtAuthConfig {
 
   // Audiences
   std::vector<std::string> audiences_;
+  bool IsValidAudience(const std::string &aud);
 
   // Each element corresponds to an issuer
   std::vector<std::shared_ptr<IssuerInfo> > issuers_;

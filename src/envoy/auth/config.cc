@@ -106,6 +106,18 @@ bool IssuerInfo::Preload(Json::Object *json) {
   return false;
 }
 
+bool JwtAuthConfig::IsValidAudience(const std::string &aud) {
+  if (audiences_.empty()) {
+    return true;
+  }
+  for (auto &a : audiences_) {
+    if (a == aud) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /*
  * TODO: add test for config loading
  */

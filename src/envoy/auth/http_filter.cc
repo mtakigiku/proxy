@@ -30,16 +30,16 @@
 namespace Envoy {
 namespace Http {
 
-namespace {
-
-std::string JsonToString(rapidjson::Document* d) {
-  rapidjson::StringBuffer buffer;
-  rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-  d->Accept(writer);
-  return buffer.GetString();
-}
-
-}  // namespace
+// namespace {
+//
+// std::string JsonToString(rapidjson::Document* d) {
+//  rapidjson::StringBuffer buffer;
+//  rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+//  d->Accept(writer);
+//  return buffer.GetString();
+//}
+//
+//}  // namespace
 
 const LowerCaseString& JwtVerificationFilter::AuthorizedHeaderKey() {
   static LowerCaseString* key = new LowerCaseString("Istio-Auth-UserInfo");
@@ -134,6 +134,7 @@ void JwtVerificationFilter::ReceivePubkey(HeaderMap& headers,
 }
 
 void JwtVerificationFilter::CompleteVerification(HeaderMap& headers) {
+  std::string fail_body = "";
   const HeaderEntry* entry = headers.get(kAuthorizationHeaderKey);
   if (entry) {
     const HeaderString& value = entry->value();
@@ -141,6 +142,7 @@ void JwtVerificationFilter::CompleteVerification(HeaderMap& headers) {
                 kAuthorizationHeaderTokenPrefix.length()) == 0) {
       std::string jwt(value.c_str() + kAuthorizationHeaderTokenPrefix.length());
 
+      Auth::JwtVerifier v(jwt);
       for (const auto& iss : config_->issuers_) {
         if (iss->failed_) {
           continue;
@@ -150,36 +152,61 @@ void JwtVerificationFilter::CompleteVerification(HeaderMap& headers) {
          * TODO: update according to change of JWT lib interface
          */
         // verifying and decoding JWT
-        std::unique_ptr<rapidjson::Document> payload;
+        //        std::unique_ptr<rapidjson::Document> payload;
+        std::unique_ptr<Auth::Pubkeys> pkey;
         if (iss->pkey_type_ == "pem") {
-          payload = Auth::Jwt::Decode(jwt, iss->pkey_);
+          pkey = Auth::Pubkeys::ParseFromPem(iss->pkey_);
+          //          payload = Auth::Jwt::Decode(jwt, iss->pkey_);
         } else if (iss->pkey_type_ == "jwks") {
-          payload = Auth::Jwt::DecodeWithJwk(jwt, iss->pkey_);
+          pkey = Auth::Pubkeys::ParseFromJwks(iss->pkey_);
+          //          payload = Auth::Jwt::DecodeWithJwk(jwt, iss->pkey_);
         }
 
-        if (payload) {
+        if (v.Verify(*pkey)) {
           // verification succeeded
-          auto payload_str = JsonToString(payload.get());
+          Json::ObjectSharedPtr payload = v.Payload();
 
           // Check the issuer's name.
-          if (payload->HasMember("iss") && (*payload)["iss"].IsString() &&
-              (*payload)["iss"].GetString() == iss->name_) {
+          std::string jwt_iss = payload->getString("iss", "");
+
+          if (jwt_iss == iss->name_) {
             /*
              * TODO: check exp claim
              */
+            std::string aud = v.Aud();
+            if (config_->IsValidAudience(aud)) {
+              /*
+               * TODO: replace appropriately
+               */
+              std::string str_to_add;
+              switch (config_->user_info_type_) {
+                case Auth::JwtAuthConfig::UserInfoType::kPayload:
+                  str_to_add = v.PayloadStr();
+                  break;
+                case Auth::JwtAuthConfig::UserInfoType::kPayloadBase64Url:
+                  str_to_add = v.PayloadStrBase64Url();
+                  break;
+                case Auth::JwtAuthConfig::UserInfoType::kHeaderPayloadBase64Url:
+                  str_to_add =
+                      v.HeaderStrBase64Url() + "." + v.PayloadStrBase64Url();
+              }
+              headers.addReferenceKey(AuthorizedHeaderKey(), str_to_add);
 
-            /*
-             * TODO: replace appropriately
-             */
-            headers.addReferenceKey(AuthorizedHeaderKey(), payload_str);
-
-            // Remove JWT from headers.
-            headers.remove(kAuthorizationHeaderKey);
-            goto end;
+              // Remove JWT from headers.
+              headers.remove(kAuthorizationHeaderKey);
+              goto end;
+            } else {
+              fail_body = Auth::StatusToString(Auth::Status::BAD_AUDIENCE);
+            }
           }
         }
       }
+      fail_body = Auth::StatusToString(v.GetStatus());
+    } else {
+      fail_body = Auth::StatusToString(Auth::Status::NO_AUTHORIZATION_HEADER);
     }
+  } else {
+    fail_body = Auth::StatusToString(Auth::Status::NO_AUTHORIZATION_HEADER);
   }
 
   // verification failed
@@ -188,7 +215,7 @@ void JwtVerificationFilter::CompleteVerification(HeaderMap& headers) {
      * TODO: detailed information on message body
      */
     Code code = Code(401);  // Unauthorized
-    std::string message_body = "Verification Failed";
+    std::string message_body = fail_body;
     Utility::sendLocalReply(*decoder_callbacks_, false, code, message_body);
     return;
   }

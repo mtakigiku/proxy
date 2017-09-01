@@ -81,6 +81,11 @@ enum class Status {
 
   // "n" or" "e" field of a JWK has a parse error or is missing.
   JWK_PUBKEY_PARSE_ERROR,
+
+  // Authorization header is missing
+  NO_AUTHORIZATION_HEADER,
+
+  BAD_AUDIENCE
 };
 
 std::string StatusToString(Status status);
@@ -164,6 +169,8 @@ class JwtVerifier : public WithStatus {
   // It returns the "iss" claim value of the given JWT, or an empty string if
   // "iss" claim does not exist.
   const std::string& Iss();
+
+  const std::string& Aud();
 
   // It returns the "exp" claim value of the given JWT, or 0 if "exp" claim does
   // not exist.

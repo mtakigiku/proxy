@@ -53,7 +53,9 @@ std::string StatusToString(Status status) {
       {Status::ALG_NOT_IMPLEMENTED, "ALG_NOT_IMPLEMENTED"},
       {Status::PEM_PUBKEY_BAD_BASE64, "PEM_PUBKEY_BAD_BASE64"},
       {Status::PEM_PUBKEY_PARSE_ERROR, "PEM_PUBKEY_PARSE_ERROR"},
-      {Status::JWK_PUBKEY_PARSE_ERROR, "JWK_PUBKEY_PARSE_ERROR"}};
+      {Status::JWK_PUBKEY_PARSE_ERROR, "JWK_PUBKEY_PARSE_ERROR"},
+      {Status::NO_AUTHORIZATION_HEADER, "NO_AUTHORIZATION_HEADER"},
+      {Status::BAD_AUDIENCE, "BAD_AUDIENCE"}};
   return table[status];
 }
 
@@ -269,6 +271,7 @@ class JwtVerifier::Impl : public WithStatus {
     }
 
     iss_ = payload_->getString("iss", "");
+    aud_ = payload_->getString("aud", "");
     exp_ = payload_->getInteger("exp", 0);
 
     // Set up signature
@@ -305,6 +308,7 @@ class JwtVerifier::Impl : public WithStatus {
   const std::string &PayloadStr() { return payload_str_; }
   const std::string &PayloadStrBase64Url() { return payload_str_base64url_; }
   const std::string &Iss() { return iss_; }
+  const std::string &Aud() { return aud_; }
   int64_t Exp() { return exp_; }
 
  private:
@@ -319,6 +323,7 @@ class JwtVerifier::Impl : public WithStatus {
   std::string alg_;
   std::string kid_;
   std::string iss_;
+  std::string aud_;
   int64_t exp_;
 
   const EVP_MD *EvpMdFromAlg(const std::string &alg) {
@@ -428,6 +433,7 @@ const std::string &JwtVerifier::PayloadStrBase64Url() {
 }
 
 const std::string &JwtVerifier::Iss() { return impl_->Iss(); }
+const std::string &JwtVerifier::Aud() { return impl_->Aud(); }
 
 int64_t JwtVerifier::Exp() { return impl_->Exp(); }
 
