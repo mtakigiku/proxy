@@ -199,6 +199,69 @@ class EvpPkeyGetter : public WithStatus {
 
 }  // namespace
 
+bool Verifier::VerifySignature(EVP_PKEY *key, const EVP_MD *md,
+                               const uint8_t *signature, size_t signature_len,
+                               const uint8_t *signed_data,
+                               size_t signed_data_len) {
+  bssl::UniquePtr<EVP_MD_CTX> md_ctx(EVP_MD_CTX_create());
+
+  EVP_DigestVerifyInit(md_ctx.get(), nullptr, md, nullptr, key);
+  EVP_DigestVerifyUpdate(md_ctx.get(), signed_data, signed_data_len);
+  return (EVP_DigestVerifyFinal(md_ctx.get(), signature, signature_len) == 1);
+}
+
+bool Verifier::VerifySignature(EVP_PKEY *key, const EVP_MD *md,
+                               const std::string &signature,
+                               const std::string &signed_data) {
+  return VerifySignature(key, md, CastToUChar(signature), signature.length(),
+                         CastToUChar(signed_data), signed_data.length());
+}
+
+bool Verifier::Verify(const Jwt &jwt, const Pubkeys &pubkeys) {
+  // If JWT status is not OK, inherits its status and return false.
+  if (jwt.GetStatus() != Status::OK) {
+    UpdateStatus(jwt.GetStatus());
+    return false;
+  }
+
+  // If pubkeys status is not OK, inherits its status and return false.
+  if (pubkeys.GetStatus() != Status::OK) {
+    UpdateStatus(pubkeys.GetStatus());
+    return false;
+  }
+
+  std::string signed_data = jwt.jwt_split[0] + '.' + jwt.jwt_split[1];
+  bool kid_alg_matched = false;
+  for (auto &pubkey : pubkeys.keys_) {
+    // If kid is specified in JWT, JWK with the same kid is used for
+    // verification.
+    // If kid is not specified in JWT, try all JWK.
+    if (jwt.kid_ != "" && pubkey->kid_ != jwt.kid_) {
+      continue;
+    }
+
+    // The same alg must be used.
+    if (pubkey->alg_specified_ && pubkey->alg_ != jwt.alg_) {
+      continue;
+    }
+    kid_alg_matched = true;
+
+    if (VerifySignature(pubkey->key_.get(), jwt.md_, jwt.signature_,
+                        signed_data)) {
+      // Verification succeeded.
+      return true;
+    }
+  }
+
+  // Verification failed.
+  if (kid_alg_matched) {
+    UpdateStatus(Status::JWT_INVALID_SIGNATURE);
+  } else {
+    UpdateStatus(Status::KID_ALG_UNMATCH);
+  }
+  return false;
+}
+
 Jwt::Jwt(const std::string &jwt) {
   // jwt must have exactly 2 dots
   if (std::count(jwt.begin(), jwt.end(), '.') != 2) {
@@ -272,69 +335,6 @@ Jwt::Jwt(const std::string &jwt) {
     UpdateStatus(Status::JWT_SIGNATURE_PARSE_ERROR);
     return;
   }
-}
-
-bool Verifier::VerifySignature(EVP_PKEY *key, const EVP_MD *md,
-                               const uint8_t *signature, size_t signature_len,
-                               const uint8_t *signed_data,
-                               size_t signed_data_len) {
-  bssl::UniquePtr<EVP_MD_CTX> md_ctx(EVP_MD_CTX_create());
-
-  EVP_DigestVerifyInit(md_ctx.get(), nullptr, md, nullptr, key);
-  EVP_DigestVerifyUpdate(md_ctx.get(), signed_data, signed_data_len);
-  return (EVP_DigestVerifyFinal(md_ctx.get(), signature, signature_len) == 1);
-}
-
-bool Verifier::VerifySignature(EVP_PKEY *key, const EVP_MD *md,
-                               const std::string &signature,
-                               const std::string &signed_data) {
-  return VerifySignature(key, md, CastToUChar(signature), signature.length(),
-                         CastToUChar(signed_data), signed_data.length());
-}
-
-bool Verifier::Verify(const Jwt &jwt, const Pubkeys &pubkeys) {
-  // If JWT status is not OK, inherits its status and return false.
-  if (jwt.GetStatus() != Status::OK) {
-    UpdateStatus(jwt.GetStatus());
-    return false;
-  }
-
-  // If pubkeys status is not OK, inherits its status and return false.
-  if (pubkeys.GetStatus() != Status::OK) {
-    UpdateStatus(pubkeys.GetStatus());
-    return false;
-  }
-
-  std::string signed_data = jwt.jwt_split[0] + '.' + jwt.jwt_split[1];
-  bool kid_alg_matched = false;
-  for (auto &pubkey : pubkeys.keys_) {
-    // If kid is specified in JWT, JWK with the same kid is used for
-    // verification.
-    // If kid is not specified in JWT, try all JWK.
-    if (jwt.kid_ != "" && pubkey->kid_ != jwt.kid_) {
-      continue;
-    }
-
-    // The same alg must be used.
-    if (pubkey->alg_specified_ && pubkey->alg_ != jwt.alg_) {
-      continue;
-    }
-    kid_alg_matched = true;
-
-    if (VerifySignature(pubkey->key_.get(), jwt.md_, jwt.signature_,
-                        signed_data)) {
-      // Verification succeeded.
-      return true;
-    }
-  }
-
-  // Verification failed.
-  if (kid_alg_matched) {
-    UpdateStatus(Status::JWT_INVALID_SIGNATURE);
-  } else {
-    UpdateStatus(Status::KID_ALG_UNMATCH);
-  }
-  return false;
 }
 
 // Returns the parsed header.
