@@ -17,8 +17,6 @@
 
 #include "common/common/base64.h"
 #include "common/common/utility.h"
-#include "common/grpc/async_client_impl.h"
-#include "common/http/utility.h"
 
 using ::google::protobuf::util::Status;
 using StatusCode = ::google::protobuf::util::error::Code;
@@ -77,18 +75,33 @@ const std::string kCheckStatusCode = "check.status";
 // Keys to well-known headers
 const LowerCaseString kRefererHeaderKey("referer");
 
-// Check cache size: 10000 cache entries.
-const int kCheckCacheEntries = 10000;
+CheckOptions GetJustCheckOptions(const MixerConfig& config) {
+  if (config.disable_check_cache) {
+    return CheckOptions(0);
+  }
+  return CheckOptions();
+}
 
 CheckOptions GetCheckOptions(const MixerConfig& config) {
-  CheckOptions options(kCheckCacheEntries);
-  options.cache_keys = config.check_cache_keys;
-
+  auto options = GetJustCheckOptions(config);
   if (config.network_fail_policy == "close") {
     options.network_fail_open = false;
   }
-
   return options;
+}
+
+QuotaOptions GetQuotaOptions(const MixerConfig& config) {
+  if (config.disable_quota_cache) {
+    return QuotaOptions(0, 1000);
+  }
+  return QuotaOptions();
+}
+
+ReportOptions GetReportOptions(const MixerConfig& config) {
+  if (config.disable_report_batch) {
+    return ReportOptions(0, 1000);
+  }
+  return ReportOptions();
 }
 
 void SetStringAttribute(const std::string& name, const std::string& value,
@@ -203,8 +216,9 @@ MixerControl::MixerControl(const MixerConfig& mixer_config,
                            Event::Dispatcher& dispatcher,
                            Runtime::RandomGenerator& random)
     : cm_(cm), mixer_config_(mixer_config) {
-  MixerClientOptions options(GetCheckOptions(mixer_config), ReportOptions(),
-                             QuotaOptions());
+  MixerClientOptions options(GetCheckOptions(mixer_config),
+                             GetReportOptions(mixer_config),
+                             GetQuotaOptions(mixer_config));
 
   options.check_transport = CheckTransport::GetFunc(cm, nullptr);
   options.report_transport = ReportTransport::GetFunc(cm);
@@ -231,7 +245,7 @@ istio::mixer_client::CancelFunc MixerControl::SendCheck(
         Status(StatusCode::INVALID_ARGUMENT, "Missing mixer_server cluster"));
     return nullptr;
   }
-  log().debug("Send Check: {}", request_data->attributes.DebugString());
+  ENVOY_LOG(debug, "Send Check: {}", request_data->attributes.DebugString());
   return mixer_client_->Check(request_data->attributes,
                               CheckTransport::GetFunc(cm_, headers), on_done);
 }
@@ -240,7 +254,7 @@ void MixerControl::SendReport(HttpRequestDataPtr request_data) {
   if (!mixer_client_) {
     return;
   }
-  log().debug("Send Report: {}", request_data->attributes.DebugString());
+  ENVOY_LOG(debug, "Send Report: {}", request_data->attributes.DebugString());
   mixer_client_->Report(request_data->attributes);
 }
 
@@ -253,7 +267,7 @@ void MixerControl::ForwardAttributes(
       mixer_config_.forward_attributes, route_attributes);
   std::string base64 =
       Base64::encode(serialized_str.c_str(), serialized_str.size());
-  log().debug("Mixer forward attributes set: {}", base64);
+  ENVOY_LOG(debug, "Mixer forward attributes set: {}", base64);
   headers.addReferenceKey(Utils::kIstioAttributeHeader, base64);
 }
 
