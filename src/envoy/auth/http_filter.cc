@@ -41,10 +41,6 @@ JwtVerificationFilter::~JwtVerificationFilter() {}
 void JwtVerificationFilter::onDestroy() {
   ENVOY_LOG(debug, "Called JwtVerificationFilter : {}", __func__);
   state_ = Responded;
-  // Cancelling all request for public keys
-  for (const auto& calling_issuer_kv : calling_issuers_) {
-    calling_issuer_kv.second.async_cb_->Cancel();
-  }
 }
 
 FilterHeadersStatus JwtVerificationFilter::decodeHeaders(HeaderMap& headers,
@@ -53,31 +49,13 @@ FilterHeadersStatus JwtVerificationFilter::decodeHeaders(HeaderMap& headers,
   state_ = Calling;
   stopped_ = false;
 
-  // list up issuers whose public key should be fetched.
-  bool at_least_one_call = false;
-  all_issuers_pubkey_expiration_checked_ = false;
-  uint32_t index = 0;
   for (const auto& iss : config_->issuers_) {
-    if (++index == config_->issuers_.size()) {
-      all_issuers_pubkey_expiration_checked_ = true;
-    }
-    if (!iss->pkey_->IsNotExpired()) {
-      // send HTTP requests to fetch public keys
-      at_least_one_call = true;
-      auto async_cb = std::unique_ptr<Auth::AsyncClientCallbacks>(
-          new Auth::AsyncClientCallbacks(
-              config_->cm_, iss->cluster_,
-              [&](bool succeed, const std::string& pubkey) -> void {
-                this->ReceivePubkey(headers, iss->name_, succeed, pubkey);
-              }));
-      calling_issuers_[iss->name_] =
-          CallingIssuerInfo{iss, std::move(async_cb)};
-      calling_issuers_[iss->name_].async_cb_->Call(iss->uri_);
-    }
+    calling_issuers_set_.insert(iss->name_);
   }
-  if (!at_least_one_call) {
-    // If we do not need to fetch any public keys, just proceed to verification.
-    CompleteVerification(headers);
+  for (const auto& iss : config_->issuers_) {
+    iss->GetKeyAndDo([&](std::shared_ptr<Auth::Pubkeys> pubkey) -> void {
+      this->ReceivePubkey(headers, iss->name_, pubkey);
+    });
   }
 
   if (state_ == Complete) {
@@ -110,34 +88,17 @@ void JwtVerificationFilter::setDecoderFilterCallbacks(
   decoder_callbacks_ = &callbacks;
 }
 
-void JwtVerificationFilter::ReceivePubkey(HeaderMap& headers,
-                                          std::string issuer_name, bool succeed,
-                                          const std::string& pubkey) {
+void JwtVerificationFilter::ReceivePubkey(
+    HeaderMap& headers, std::string issuer_name,
+    std::shared_ptr<Auth::Pubkeys> pubkey) {
   ENVOY_LOG(debug, "Called JwtVerificationFilter : {} , issuer = {}", __func__,
             issuer_name);
-  auto iss_it = calling_issuers_.find(issuer_name);
-  auto& iss = iss_it->second.iss_;
-  // Update the public key.
-  if (succeed) {
-    if (iss->pkey_type_ == "pem") {
-      iss->pkey_->Update(Auth::Pubkeys::CreateFromPem(pubkey));
-    } else if (iss->pkey_type_ == "jwks") {
-      iss->pkey_->Update(Auth::Pubkeys::CreateFromJwks(pubkey));
-    } else {
-      PANIC("should not reach here");
-    }
-  } else {
-    // Even when fetching public key is failed, we should call Update() to
-    // unlock mutex.
-    // We set nullptr and update the expiration.
-    iss->pkey_->Update(nullptr);
-  }
-  calling_issuers_.erase(iss_it);
+
+  calling_issuers_set_.erase(issuer_name);
+  pubkeys_copy_[issuer_name] = pubkey;
 
   // If it receive all responses, proceed to verification.
-  // Note that we should make sure that all issuer's public key expiration are
-  // checked.
-  if (calling_issuers_.empty() && all_issuers_pubkey_expiration_checked_) {
+  if (calling_issuers_set_.empty()) {
     CompleteVerification(headers);
   }
 }
@@ -166,7 +127,7 @@ std::string JwtVerificationFilter::Verify(HeaderMap& headers) {
    */
 
   for (const auto& iss : config_->issuers_) {
-    std::shared_ptr<Auth::Pubkeys> pkey = iss->pkey_->Get();
+    std::shared_ptr<Auth::Pubkeys> pkey = pubkeys_copy_[iss->name_];
     if (!pkey || pkey->GetStatus() != Auth::Status::OK) {
       continue;
     }

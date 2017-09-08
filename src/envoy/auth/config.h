@@ -34,39 +34,16 @@ namespace Envoy {
 namespace Http {
 namespace Auth {
 
-// Callback class for AsyncClient.
-class AsyncClientCallbacks : public AsyncClient::Callbacks,
-                             public Logger::Loggable<Logger::Id::http> {
- public:
-  AsyncClientCallbacks(Upstream::ClusterManager &cm, const std::string &cluster,
-                       std::function<void(bool, const std::string &)> cb)
-      : cm_(cm),
-        cluster_(cm.get(cluster)->info()),
-        timeout_(Optional<std::chrono::milliseconds>()),
-        cb_(cb) {}
-  // AsyncClient::Callbacks
-  void onSuccess(MessagePtr &&response);
-  void onFailure(AsyncClient::FailureReason);
-
-  void Call(const std::string &uri);
-  void Cancel();
-
- private:
-  Upstream::ClusterManager &cm_;
-  Upstream::ClusterInfoConstSharedPtr cluster_;
-  Optional<std::chrono::milliseconds> timeout_;
-  std::function<void(bool, const std::string &)> cb_;
-  AsyncClient::Request *request_;
-};
-
 struct JwtAuthConfig;
 
 // Struct to hold an issuer's information.
-struct IssuerInfo : public Logger::Loggable<Logger::Id::http> {
+struct IssuerInfo : public AsyncClient::Callbacks,
+                    public Logger::Loggable<Logger::Id::http> {
   // This constructor loads config from JSON. When public key is given via URI,
   // it just keeps URI and cluster name, and public key will be fetched later,
   // namely in decodeHeaders() of the filter class.
   IssuerInfo(Json::Object *json, const JwtAuthConfig &parent);
+  ~IssuerInfo();
 
   // True if the config loading failed in the constructor.
   // If this is true, this issuer will be ignored.
@@ -78,6 +55,31 @@ struct IssuerInfo : public Logger::Loggable<Logger::Id::http> {
   std::string name_;       // e.g. "https://accounts.example.com"
   std::string pkey_type_;  // Format of public key. "jwks" or "pem"
 
+  typedef std::function<void(std::shared_ptr<Pubkeys>)> PubkeyCallBack;
+  void GetKeyAndDo(PubkeyCallBack callback);
+
+  void onSuccess(MessagePtr &&response);
+  void onFailure(AsyncClient::FailureReason);
+
+ private:
+  const JwtAuthConfig &parent_;
+
+  void Call();
+  void Cancel();
+
+  Upstream::ClusterInfoConstSharedPtr cluster_info_;
+  Optional<std::chrono::milliseconds> timeout_;
+  AsyncClient::Request *request_;
+
+  enum State { OK, ValueNotSet, Calling };
+  State state_;
+  std::mutex mutex_state_;
+
+  std::vector<PubkeyCallBack> pending_callbacks_;
+  void ProcessPendingCallbacks();
+
+  std::mutex mutex_pending_callbacks_;
+
   // Class to hold public key.
   // (1) If regular update is not needed (the case public key is given directly
   // in config file or by giving local file path), the constructor Pubkey()
@@ -85,34 +87,18 @@ struct IssuerInfo : public Logger::Loggable<Logger::Id::http> {
   // (2) If regular update is needed (the case only url and cluster are given
   // and public key should be fetched), the constructor Pubkey(valid_period)
   // should be called.
-  class Pubkey {
-   public:
-    Pubkey();                                         // Without update version
+  struct Pubkey {
+    Pubkey(std::unique_ptr<Pubkeys> pkey);            // Without update version
     Pubkey(std::chrono::duration<int> valid_period);  // With update version
 
     // IsNotExpired() checks if public key should be updated.
     // If public key has not been set yet, it returns false.
     // If regular update is not needed (the case (1)), it always returns true.
-    // When it returns false, mutex_pkey_ is locked and should be unlocked by
-    // calling Update().
     bool IsNotExpired();
 
-    // It updates the public key.
-    // If regular updated is needed (the case (2)), it also unlocks mutex_pkey_
-    // and updates the expiration time.
-    // It should also be called in the case (1) to initialize the public key in
-    // config loading.
-    void Update(std::unique_ptr<Pubkeys> pkey);
-
-    // It returns the public key. It might returns nullptr (when fetching
-    // failed).
-    // If someone is locking mutex_pkey_ to update it, it waits until the
-    // updating finishes.
-    std::shared_ptr<Pubkeys> Get();
-
-   private:
+    // Writing for pkey_ happens only if state_ == Calling.
+    // Reading for pkey_ happens only if state_ == OK.
     std::shared_ptr<Pubkeys> pkey_;
-    std::mutex mutex_pkey_;
     std::chrono::time_point<std::chrono::system_clock> expiration_;
 
     // Updating frequency.

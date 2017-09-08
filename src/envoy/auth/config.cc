@@ -34,49 +34,54 @@ namespace Envoy {
 namespace Http {
 namespace Auth {
 
-void AsyncClientCallbacks::onSuccess(MessagePtr &&response) {
+IssuerInfo::~IssuerInfo() { Cancel(); }
+void IssuerInfo::onSuccess(MessagePtr &&response) {
   std::string status = response->headers().Status()->value().c_str();
   if (status == "200") {
-    ENVOY_LOG(debug, "AsyncClientCallbacks [cluster = {}]: success",
-              cluster_->name());
+    ENVOY_LOG(debug, "IssuerInfo [cluster = {}]: {}", cluster_, __func__);
     std::string body;
     if (response->body()) {
       auto len = response->body()->length();
       body = std::string(static_cast<char *>(response->body()->linearize(len)),
                          len);
     } else {
-      ENVOY_LOG(debug, "AsyncClientCallbacks [cluster = {}]: body is null",
-                cluster_->name());
+      ENVOY_LOG(debug, "IssuerInfo [cluster = {}]: body is null", cluster_);
     }
-    cb_(true, body);
+    if (pkey_type_ == "pem") {
+      pkey_->pkey_ = std::move(Pubkeys::CreateFromPem(body));
+    } else if (pkey_type_ == "jwks") {
+      pkey_->pkey_ = std::move(Pubkeys::CreateFromJwks(body));
+    } else {
+      PANIC("should not reach here");
+    }
   } else {
-    ENVOY_LOG(debug,
-              "AsyncClientCallbacks [cluster = {}]: response status code {}",
-              cluster_->name(), status);
-    cb_(false, "");
+    ENVOY_LOG(debug, "IssuerInfo [cluster = {}]: response status code {}",
+              cluster_, status);
+    pkey_->pkey_ = nullptr;
   }
+  ProcessPendingCallbacks();
 }
-void AsyncClientCallbacks::onFailure(AsyncClient::FailureReason) {
-  ENVOY_LOG(debug, "AsyncClientCallbacks [cluster = {}]: failed",
-            cluster_->name());
-  cb_(false, "");
+void IssuerInfo::onFailure(AsyncClient::FailureReason) {
+  ENVOY_LOG(debug, "IssuerInfo [cluster = {}]: {}", cluster_, __func__);
+  pkey_->pkey_ = nullptr;
+  ProcessPendingCallbacks();
 }
 
-void AsyncClientCallbacks::Call(const std::string &uri) {
-  ENVOY_LOG(debug, "AsyncClientCallbacks [cluster = {}]: {} {}",
-            cluster_->name(), __func__, uri);
+void IssuerInfo::Call() {
+  ENVOY_LOG(debug, "IssuerInfo [cluster = {}]: {} {}", cluster_, __func__,
+            uri_);
   // Example:
   // uri  = "https://example.com/certs"
   // pos  :          ^
   // pos1 :                     ^
   // host = "example.com"
   // path = "/certs"
-  auto pos = uri.find("://");
+  auto pos = uri_.find("://");
   pos = pos == std::string::npos ? 0 : pos + 3;  // Start position of host
-  auto pos1 = uri.find("/", pos);
-  if (pos1 == std::string::npos) pos1 = uri.length();
-  std::string host = uri.substr(pos, pos1 - pos);
-  std::string path = "/" + uri.substr(pos1 + 1);
+  auto pos1 = uri_.find("/", pos);
+  if (pos1 == std::string::npos) pos1 = uri_.length();
+  std::string host = uri_.substr(pos, pos1 - pos);
+  std::string path = "/" + uri_.substr(pos1 + 1);
 
   MessagePtr message(new RequestMessageImpl());
   message->headers().insertMethod().value().setReference(
@@ -84,54 +89,66 @@ void AsyncClientCallbacks::Call(const std::string &uri) {
   message->headers().insertPath().value(path);
   message->headers().insertHost().value(host);
 
-  request_ = cm_.httpAsyncClientForCluster(cluster_->name())
+  request_ = parent_.cm_.httpAsyncClientForCluster(cluster_info_->name())
                  .send(std::move(message), *this, timeout_);
 }
 
-void AsyncClientCallbacks::Cancel() { request_->cancel(); }
+void IssuerInfo::Cancel() { request_->cancel(); }
 
-IssuerInfo::Pubkey::Pubkey() : update_needed_(false) {}
+void IssuerInfo::ProcessPendingCallbacks() {
+  pkey_->expiration_ = std::chrono::system_clock::now() + pkey_->valid_period_;
+  {
+    std::lock_guard<std::mutex> guard(mutex_pending_callbacks_);
+    for (auto &callback : pending_callbacks_) {
+      callback(pkey_->pkey_);
+    }
+    pending_callbacks_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> guard(mutex_state_);
+    state_ = State::OK;
+  }
+}
+void IssuerInfo::GetKeyAndDo(PubkeyCallBack callback) {
+  if (pkey_->update_needed_) {
+    {
+      std::lock_guard<std::mutex> guard(mutex_state_);
+      if (state_ == State::Calling) {
+        std::lock_guard<std::mutex> guard(mutex_pending_callbacks_);
+        pending_callbacks_.push_back(callback);
+        return;
+      }
+      if (state_ == State::OK && pkey_->IsNotExpired()) {
+        callback(pkey_->pkey_);
+        return;
+      }
+      state_ = Calling;
+    }
+    {
+      std::lock_guard<std::mutex> guard(mutex_pending_callbacks_);
+      pending_callbacks_.push_back(callback);
+    }
+    Call();
+
+  } else {
+    callback(pkey_->pkey_);
+  }
+}
+
+IssuerInfo::Pubkey::Pubkey(std::unique_ptr<Pubkeys> pkey)
+    : update_needed_(false) {
+  pkey_ = std::move(pkey);
+}
 
 IssuerInfo::Pubkey::Pubkey(std::chrono::duration<int> valid_period)
     : valid_period_(valid_period), update_needed_(true) {}
 
 bool IssuerInfo::Pubkey::IsNotExpired() {
-  if (update_needed_) {
-    mutex_pkey_.lock();
-    if (std::chrono::system_clock::now() < expiration_) {
-      // If fetched key is not expired, unlock mutex.
-      mutex_pkey_.unlock();
-      return true;
-    } else {
-      // If fetched key is expired, mutex is kept locked and should be unlocked
-      // by calling Update().
-      return false;
-    }
-  } else {
-    return true;
-  }
+  return (!update_needed_) || (std::chrono::system_clock::now() < expiration_);
 }
 
-void IssuerInfo::Pubkey::Update(std::unique_ptr<Pubkeys> pkey) {
-  if (update_needed_) {
-    pkey_ = std::move(pkey);
-    expiration_ = std::chrono::system_clock::now() + valid_period_;
-    mutex_pkey_.unlock();
-  } else {
-    pkey_ = std::move(pkey);
-  }
-}
-
-std::shared_ptr<Pubkeys> IssuerInfo::Pubkey::Get() {
-  if (update_needed_) {
-    std::lock_guard<std::mutex> guard(mutex_pkey_);
-    return pkey_;
-  } else {
-    return pkey_;
-  }
-}
-
-IssuerInfo::IssuerInfo(Json::Object *json, const JwtAuthConfig &parent) {
+IssuerInfo::IssuerInfo(Json::Object *json, const JwtAuthConfig &parent)
+    : parent_(parent), timeout_(Optional<std::chrono::milliseconds>()) {
   ENVOY_LOG(debug, "IssuerInfo: {}", __func__);
   // Check "name"
   name_ = json->getString("name", "");
@@ -164,12 +181,14 @@ IssuerInfo::IssuerInfo(Json::Object *json, const JwtAuthConfig &parent) {
   // Check "value"
   std::string value = json_pubkey->getString("value", "");
   if (value != "") {
-    pkey_ = std::unique_ptr<Pubkey>(new Pubkey());
+    //    pkey_ = std::unique_ptr<Pubkey>(new Pubkey());
     // Public key is written in this JSON.
     if (pkey_type_ == "pem") {
-      pkey_->Update(Pubkeys::CreateFromPem(value));
+      pkey_ =
+          std::unique_ptr<Pubkey>(new Pubkey(Pubkeys::CreateFromPem(value)));
     } else if (pkey_type_ == "jwks") {
-      pkey_->Update(Pubkeys::CreateFromJwks(value));
+      pkey_ =
+          std::unique_ptr<Pubkey>(new Pubkey(Pubkeys::CreateFromJwks(value)));
     }
     return;
   }
@@ -177,11 +196,13 @@ IssuerInfo::IssuerInfo(Json::Object *json, const JwtAuthConfig &parent) {
   std::string path = json_pubkey->getString("file", "");
   if (path != "") {
     // Public key is loaded from the specified file.
-    pkey_ = std::unique_ptr<Pubkey>(new Pubkey());
+    //    pkey_ = std::unique_ptr<Pubkey>(new Pubkey());
     if (pkey_type_ == "pem") {
-      pkey_->Update(Pubkeys::CreateFromPem(Filesystem::fileReadToEnd(path)));
+      pkey_ = std::unique_ptr<Pubkey>(
+          new Pubkey(Pubkeys::CreateFromPem(Filesystem::fileReadToEnd(path))));
     } else if (pkey_type_ == "jwks") {
-      pkey_->Update(Pubkeys::CreateFromJwks(Filesystem::fileReadToEnd(path)));
+      pkey_ = std::unique_ptr<Pubkey>(
+          new Pubkey(Pubkeys::CreateFromJwks(Filesystem::fileReadToEnd(path))));
     }
     return;
   }
@@ -192,6 +213,7 @@ IssuerInfo::IssuerInfo(Json::Object *json, const JwtAuthConfig &parent) {
     // Public key will be loaded from the specified URI.
     uri_ = uri;
     cluster_ = cluster;
+    cluster_info_ = parent_.cm_.get(cluster_)->info();
     pkey_ = std::unique_ptr<Pubkey>(
         new Pubkey(std::chrono::seconds(parent.pubkey_cache_expiration_sec_)));
     return;

@@ -59,19 +59,26 @@ class JwtVerificationFilter : public StreamDecoderFilter,
 
   // Struct to hold an issuer whose public key is being fetched, together with
   // the client making the request for its public key.
-  struct CallingIssuerInfo {
-    std::shared_ptr<Auth::IssuerInfo> iss_;
-    std::unique_ptr<Auth::AsyncClientCallbacks> async_cb_;
-  };
+  //  struct CallingIssuerInfo {
+  //    std::shared_ptr<Auth::IssuerInfo> iss_;
+  //    std::unique_ptr<Auth::AsyncClientCallbacks> async_cb_;
+  //  };
 
   // Map to keep the set of issuers whose public key is being fetched.
   // Key: Issuer's name
-  std::map<std::string, CallingIssuerInfo> calling_issuers_;
+  //  std::map<std::string, CallingIssuerInfo> calling_issuers_;
+  std::set<std::string> calling_issuers_set_;
   // Flag to check if expirations of all public keys are checked.
-  bool all_issuers_pubkey_expiration_checked_;
+  //  bool all_issuers_pubkey_expiration_checked_;
 
-  void ReceivePubkey(HeaderMap& headers, std::string issuer_name, bool succeed,
-                     const std::string& pubkey);
+  /*
+   * TODO: use thread_local?
+   */
+  // copies of public keys, stored as filter's member
+  std::map<std::string, std::shared_ptr<Auth::Pubkeys> > pubkeys_copy_;
+
+  void ReceivePubkey(HeaderMap& headers, std::string issuer_name,
+                     std::shared_ptr<Auth::Pubkeys> pubkey);
   void LoadPubkeys(HeaderMap& headers);
   std::string Verify(HeaderMap& headers);
   void CompleteVerification(HeaderMap& headers);
